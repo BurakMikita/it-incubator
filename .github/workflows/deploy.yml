@@ -76,7 +76,7 @@ jobs:
   notify:
     needs: [checks, build, deploy, verify]
     if: always()
-    uses: ./.github/workflows/notify/notify.yml
+    uses: ./.github/workflows/notify.yml
     with:
       checks_result: ${{ needs.checks.result }}
       build_result: ${{ needs.build.result }}
