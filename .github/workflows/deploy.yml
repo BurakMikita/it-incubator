@@ -5,73 +5,47 @@ on:
     branches: ["main"]
 
 jobs:
-  check:
+  checks:
     uses: ./.github/workflows/pr-check.yml
 
-  build-backend:
-    needs: check
+  build:
+    needs: checks
     runs-on: ubuntu-latest
-    outputs:
-      image_sha: ${{ steps.meta.outputs.image_sha }}
+    strategy:
+      matrix:
+        include:
+          - service: back
+            image: todo-back
+          - service: front
+            image: todo-front
+            build_arg: VITE_API_URL
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKER_PASS }}" | docker login -u "${{ vars.DOCKER_USER }}" --password-stdin
 
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ vars.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_PASS }}
+      - name: Build image
+        env:
+          VITE_API_URL: ${{ vars.VITE_BACKEND_URL }}
+        run: |
+          BUILD_ARG_FLAG=""
+          if [ -n "${{ matrix.build_arg }}" ]; then
+            BUILD_ARG_FLAG="--build-arg ${{ matrix.build_arg }}=${VITE_API_URL}"
+          fi
+          docker build \
+            ${BUILD_ARG_FLAG} \
+            -t ${{ vars.DOCKER_USER }}/${{ matrix.image }}:sha-${{ github.sha }} \
+            -t ${{ vars.DOCKER_USER }}/${{ matrix.image }}:latest \
+            ./${{ matrix.service }}
 
-      - name: Build and push backend image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./backend
-          push: true
-          tags: |
-            ${{ vars.DOCKER_USER }}/talaka-backend:sha-${{ github.sha }}
-            ${{ vars.DOCKER_USER }}/talaka-backend:latest
-          cache-from: type=gha,scope=backend
-          cache-to: type=gha,mode=max,scope=backend
-
-      - name: Set image output
-        id: meta
-        run: echo "image_sha=${{ vars.DOCKER_USER }}/talaka-backend:sha-${{ github.sha }}" >> $GITHUB_OUTPUT
-
-  build-frontend:
-    needs: check
-    runs-on: ubuntu-latest
-    outputs:
-      image_sha: ${{ steps.meta.outputs.image_sha }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ vars.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_PASS }}
-
-      - name: Build and push frontend image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./frontend
-          push: true
-          tags: |
-            ${{ vars.DOCKER_USER }}/talaka-frontend:sha-${{ github.sha }}
-            ${{ vars.DOCKER_USER }}/talaka-frontend:latest
-          build-args: |
-            VITE_BACKEND_URL=${{ vars.VITE_BACKEND_URL }}
-          cache-from: type=gha,scope=frontend
-          cache-to: type=gha,mode=max,scope=frontend
-
-      - name: Set image output
-        id: meta
-        run: echo "image_sha=${{ vars.DOCKER_USER }}/talaka-frontend:sha-${{ github.sha }}" >> $GITHUB_OUTPUT
+      - name: Push image
+        run: |
+          docker push ${{ vars.DOCKER_USER }}/${{ matrix.image }}:sha-${{ github.sha }}
+          docker push ${{ vars.DOCKER_USER }}/${{ matrix.image }}:latest
 
   deploy:
-    needs: [build-backend, build-frontend]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
@@ -82,20 +56,30 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
-            cd ~/talaka
-            touch .env
-            sed -i '/^BACKEND_IMAGE=/d' .env
-            sed -i '/^FRONTEND_IMAGE=/d' .env
-            echo "BACKEND_IMAGE=${{ needs.build-backend.outputs.image_sha }}" >> .env
-            echo "FRONTEND_IMAGE=${{ needs.build-frontend.outputs.image_sha }}" >> .env
-            docker compose pull backend frontend
-            docker compose up -d backend frontend
+            cd ~/myapp
+            sed -i "s|^APP_VERSION=.*|APP_VERSION=sha-${{ github.sha }}|" .env.development.compose
+            docker compose --env-file .env.development.compose pull back front
+            docker compose --env-file .env.development.compose up -d --no-deps back front
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke
+        env:
+          E2E_BASE_URL: ${{ vars.VITE_API_URL }}
+        run: |
+          # vars.VITE_API_URL у нас вида https://домен/api → отрежем /api
+          export E2E_BASE_URL="${E2E_BASE_URL%/api}"
+          bash scripts/smoke.sh
 
   notify:
-    needs: [check, build-backend, build-frontend, deploy]
+    needs: [checks, build, deploy, verify]
     if: always()
-    uses: ./.github/workflows/notify.yml
+    uses: ./.github/workflows/notify/notify.yml
     with:
-      check_result: ${{ needs.check.result }}
+      checks_result: ${{ needs.checks.result }}
+      build_result: ${{ needs.build.result }}
       deploy_result: ${{ needs.deploy.result }}
+      verify_result: ${{ needs.verify.result }}
     secrets: inherit
