@@ -1,0 +1,85 @@
+name: Deploy
+
+on:
+  push:
+    branches: ["week4"]
+
+jobs:
+  checks:
+    uses: ./.github/workflows/pr-check.yaml
+
+  build:
+    needs: checks
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: back
+            image: todo-back
+          - service: front
+            image: todo-front
+            build_arg: VITE_API_URL
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKER_PASS }}" | docker login -u "${{ vars.DOCKER_USER }}" --password-stdin
+
+      - name: Build image
+        env:
+          VITE_API_URL: ${{ vars.VITE_BACKEND_URL }}
+        run: |
+          BUILD_ARG_FLAG=""
+          if [ -n "${{ matrix.build_arg }}" ]; then
+            BUILD_ARG_FLAG="--build-arg ${{ matrix.build_arg }}=${VITE_API_URL}"
+          fi
+          docker build \
+            ${BUILD_ARG_FLAG} \
+            -t ${{ vars.DOCKER_USER }}/${{ matrix.image }}:sha-${{ github.sha }} \
+            -t ${{ vars.DOCKER_USER }}/${{ matrix.image }}:latest \
+            ./${{ matrix.service }}
+
+      - name: Push image
+        run: |
+          docker push ${{ vars.DOCKER_USER }}/${{ matrix.image }}:sha-${{ github.sha }}
+          docker push ${{ vars.DOCKER_USER }}/${{ matrix.image }}:latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          script: |
+            cd ~/myapp
+            sed -i "s|^APP_VERSION=.*|APP_VERSION=sha-${{ github.sha }}|" .env.development.compose
+            docker compose --env-file .env.development.compose pull back front
+            docker compose --env-file .env.development.compose up -d --no-deps back front
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke
+        env:
+          E2E_BASE_URL: ${{ vars.VITE_BACKEND_URL }}
+        run: |
+          # vars.VITE_API_URL у нас вида https://домен/api → отрежем /api
+          export E2E_BASE_URL="${E2E_BASE_URL%/api}"
+          bash scripts/smoke.sh
+
+  notify:
+    needs: [checks, build, deploy, verify]
+    if: always()
+    uses: ./.github/workflows/notify.yml
+    with:
+      checks_result: ${{ needs.checks.result }}
+      build_result: ${{ needs.build.result }}
+      deploy_result: ${{ needs.deploy.result }}
+      verify_result: ${{ needs.verify.result }}
+    secrets: inherit
